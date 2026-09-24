@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Activation is handled by the login shell; fail early if the snapshot lost its toolchain.
+node_home="$HOME/.local/share/junior-node/v24.18.0"
+[[ "$("$node_home/bin/node" --version)" == v24.18.0 ]]
+[[ "$("$node_home/bin/pnpm" --version)" == 11.8.0 ]]

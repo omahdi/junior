@@ -24,3 +24,4 @@ packages/junior-evals/guardian-results*.json
 packages/junior-evals/eval-results/
 .env*
 test-results/
+.amp/portals/*

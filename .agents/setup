@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$repo_root"
+
+node_version="24.18.0" # Keep in sync with .node-version and CI's setup-node-pnpm action.
+node_home="$HOME/.local/share/junior-node/v$node_version"
+node_archive="node-v$node_version-linux-x64.tar.xz"
+started=$SECONDS
+
+if [[ ! -x "$node_home/bin/node" ]]; then
+  echo "Installing Node $node_version"
+  mkdir -p "$(dirname "$node_home")"
+  download_dir="$(mktemp -d)"
+  install_dir="$(mktemp -d "$(dirname "$node_home")/.v$node_version.XXXXXX")"
+  trap 'rm -rf "$download_dir" "$install_dir"' EXIT
+  curl -fsSL "https://nodejs.org/dist/v$node_version/$node_archive" -o "$download_dir/$node_archive"
+  curl -fsSL "https://nodejs.org/dist/v$node_version/SHASUMS256.txt" -o "$download_dir/SHASUMS256.txt"
+  (cd "$download_dir" && grep "  $node_archive\$" SHASUMS256.txt | sha256sum --check)
+  tar -xJf "$download_dir/$node_archive" -C "$install_dir" --strip-components=1
+  mv "$install_dir" "$node_home"
+  rm -rf "$download_dir"
+  trap - EXIT
+fi
+
+export PATH="$node_home/bin:$PATH"
+profile_marker="# junior orb Node toolchain"
+if ! grep -Fqx "$profile_marker" "$HOME/.bash_profile" 2>/dev/null; then
+  cat >> "$HOME/.bash_profile" <<EOF
+
+$profile_marker
+if [[ "\$PWD" == "$repo_root" || "\$PWD" == "$repo_root/"* ]]; then
+  export PATH="$node_home/bin:\$PATH"
+fi
+EOF
+fi
+
+if [[ ! -x "$node_home/bin/pnpm" ]] || [[ "$(pnpm --version)" != 11.8.0 ]]; then
+  echo "Installing pnpm 11.8.0"
+  npm install --global --prefix "$node_home" pnpm@11.8.0
+fi
+
+echo "Installing workspace dependencies (elapsed: $((SECONDS - started))s)"
+pnpm install --frozen-lockfile
+echo "Orb setup complete in $((SECONDS - started))s"
