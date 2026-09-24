@@ -37,6 +37,17 @@ Use **pnpm**: `pnpm install`, `pnpm dev`, `pnpm test`, `pnpm typecheck`, `pnpm s
 - Exported functions need brief intent-focused JSDoc; follow `policies/code-comments.md`.
 - Run applicable checks, move durable explanations beside the owning code, and delete completed plans.
 
+## Beads tasks
+
+This repo uses the shared `omahdi/lvtasks` database through `.beads/redirect`.
+Tag every new top-level Junior task with `project/junior`:
+`bd create "<title>" -l project/junior`. Add topic labels as needed.
+Children made with `--parent <id>` inherit the parent's labels. If you use
+`--no-inherit-labels`, add `-l project/junior` yourself.
+Use `bd list -l project/junior` or `bd ready -l project/junior` to find new
+Junior work. Older tasks may have only `junior-selfhost` or `junior-classifier`.
+Do not use `--repo` or issue metadata as a substitute for the ownership label.
+
 ## Testing And Validation
 
 - Follow `policies/testing.md` and `policies/evals.md`. Product/runtime behavior belongs in integration tests through real Junior wiring (fake only Slack and LLMs via shared harnesses); agent interpretation and reply quality belong in evals; unit tests are reserved for isolated deterministic logic.
