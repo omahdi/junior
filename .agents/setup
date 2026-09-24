@@ -43,4 +43,65 @@ fi
 
 echo "Installing workspace dependencies (elapsed: $((SECONDS - started))s)"
 pnpm install --frozen-lockfile
+
+go_version="1.26.7" # Beads' current go.mod toolchain directive.
+go_home="$HOME/.local/share/junior-go/$go_version"
+if [[ ! -x "$go_home/bin/go" ]]; then
+  echo "Installing Go $go_version (elapsed: $((SECONDS - started))s)"
+  go_archive="go$go_version.linux-amd64.tar.gz"
+  go_checksum="ffb5f8de10c62550dfddab66b36b57030721e0a44a3218e9e1181d7b59f121ca"
+  mkdir -p "$(dirname "$go_home")"
+  download_dir="$(mktemp -d)"
+  install_dir="$(mktemp -d "$(dirname "$go_home")/.go$go_version.XXXXXX")"
+  trap 'rm -rf "$download_dir" "$install_dir"' EXIT
+  curl -fsSL "https://go.dev/dl/$go_archive" -o "$download_dir/$go_archive"
+  echo "$go_checksum  $download_dir/$go_archive" | sha256sum --check
+  tar -xzf "$download_dir/$go_archive" -C "$install_dir" --strip-components=1
+  mv "$install_dir" "$go_home"
+  rm -rf "$download_dir"
+  trap - EXIT
+fi
+export PATH="$go_home/bin:$HOME/.local/bin:$PATH"
+
+beads_source="$HOME/.cache/beads-source"
+if [[ ! -d "$beads_source/.git" ]]; then
+  echo "Cloning Beads source (elapsed: $((SECONDS - started))s)"
+  git clone --depth 1 --branch main https://github.com/gastownhall/beads "$beads_source"
+else
+  git -C "$beads_source" fetch --quiet --depth 1 origin main
+  git -C "$beads_source" checkout --quiet --detach FETCH_HEAD
+fi
+beads_revision="$(git -C "$beads_source" rev-parse HEAD)"
+beads_stamp="$HOME/.local/share/junior-beads-revision"
+if [[ ! -x "$HOME/.local/bin/bd" ]] || [[ "$(cat "$beads_stamp" 2>/dev/null || :)" != "$beads_revision" ]]; then
+  echo "Building Beads $beads_revision (elapsed: $((SECONDS - started))s)"
+  mkdir -p "$HOME/.local/bin"
+  (cd "$beads_source" && CGO_ENABLED=1 go build -tags gms_pure_go \
+    -ldflags="-X main.Build=${beads_revision:0:7}" \
+    -o "$HOME/.local/bin/bd.new" ./cmd/bd)
+  mv -f "$HOME/.local/bin/bd.new" "$HOME/.local/bin/bd"
+  printf '%s\n' "$beads_revision" > "$beads_stamp"
+fi
+
+if [[ ! -d /home/user/workspace/repos/lvtasks/.git ]]; then
+  echo "Cloning shared lvtasks repository (elapsed: $((SECONDS - started))s)"
+  mkdir -p /home/user/workspace/repos
+  git clone https://github.com/omahdi/lvtasks /home/user/workspace/repos/lvtasks
+fi
+chmod 700 /home/user/workspace/repos/lvtasks/.beads
+if [[ ! -d /home/user/workspace/repos/lvtasks/.beads/embeddeddolt ]]; then
+  echo "Bootstrapping local Beads database (elapsed: $((SECONDS - started))s)"
+  bd -C /home/user/workspace/repos/lvtasks bootstrap --yes --quiet
+fi
+
+beads_profile_marker="# junior orb Beads toolchain"
+if ! grep -Fqx "$beads_profile_marker" "$HOME/.bash_profile" 2>/dev/null; then
+  cat >> "$HOME/.bash_profile" <<EOF
+
+$beads_profile_marker
+if [[ "\$PWD" == "$repo_root" || "\$PWD" == "$repo_root/"* ]]; then
+  export PATH="$go_home/bin:$HOME/.local/bin:\$PATH"
+fi
+EOF
+fi
 echo "Orb setup complete in $((SECONDS - started))s"
