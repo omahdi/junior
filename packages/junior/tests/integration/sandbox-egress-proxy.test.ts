@@ -193,7 +193,7 @@ async function registerManagedEgressPlugin(input?: {
   });
 }
 
-async function registerOAuthBrokerPlugin() {
+async function registerOAuthBrokerPlugin(hooks?: PluginHooks) {
   const { createApp, defineJuniorPlugins } = await import("@/app");
   await createApp({
     plugins: defineJuniorPlugins([
@@ -216,6 +216,7 @@ async function registerOAuthBrokerPlugin() {
             scope: "broker.read",
           },
         },
+        ...(hooks ? { hooks } : undefined),
       }),
     ]),
     waitUntil(task) {
@@ -414,6 +415,73 @@ describe("sandbox egress proxy integration", () => {
         scope: "broker.read",
       },
     });
+  });
+
+  it("uses OAuth broker credentials when a credential hook returns no grant", async () => {
+    delete process.env.OAUTH_BROKER_ACCESS_TOKEN;
+    await registerOAuthBrokerPlugin({
+      grantForEgress: (ctx) =>
+        ctx.request.method === "GET"
+          ? { name: "org-read", access: "read", reason: "broker.org-read" }
+          : undefined,
+      issueCredential: () => ({
+        type: "lease",
+        lease: {
+          expiresAt: new Date(Date.now() + 60_000).toISOString(),
+          headerTransforms: [
+            {
+              domain: OAUTH_BROKER_PROVIDER_HOST,
+              headers: { Authorization: "Bearer org-read-token" },
+            },
+          ],
+        },
+      }),
+    });
+    const credentialToken = modules.session.createSandboxEgressCredentialToken({
+      credentials: { actor: { type: "user", userId: ACTOR_ID } },
+      egressId: EGRESS_ID,
+      ttlMs: 60_000,
+    });
+    const networkPolicy = modules.policy.buildSandboxEgressNetworkPolicy({
+      credentialToken,
+    });
+    const forwardURL = forwardUrlFor(networkPolicy, OAUTH_BROKER_PROVIDER_HOST);
+    const upstreamFetch = vi.fn(
+      async (_url: URL | string, init?: RequestInit) =>
+        new Response(new Headers(init?.headers).get("authorization")),
+    );
+
+    const readResponse = await modules.proxy.proxySandboxEgressRequest(
+      proxiedRequest({
+        forwardURL,
+        upstreamHost: OAUTH_BROKER_PROVIDER_HOST,
+      }),
+      {
+        fetch: upstreamFetch as typeof fetch,
+        verifyOidc: async () => ({ sandbox_id: EGRESS_ID }),
+      },
+    );
+    expect(readResponse.status).toBe(200);
+    await expect(readResponse.text()).resolves.toBe("Bearer org-read-token");
+
+    const writeResponse = await modules.proxy.proxySandboxEgressRequest(
+      proxiedRequest({
+        forwardURL,
+        method: "POST",
+        upstreamHost: OAUTH_BROKER_PROVIDER_HOST,
+        upstreamPath: "/v1/repos",
+        body: JSON.stringify({ name: "repo" }),
+      }),
+      {
+        fetch: upstreamFetch as typeof fetch,
+        verifyOidc: async () => ({ sandbox_id: EGRESS_ID }),
+      },
+    );
+    expect(writeResponse.status).toBe(401);
+    await expect(writeResponse.text()).resolves.toContain(
+      "junior-auth-required provider=oauth-broker grant=default access=write",
+    );
+    expect(upstreamFetch).toHaveBeenCalledTimes(1);
   });
 
   it("preserves configured trace headers at the real plugin egress proxy", async () => {
@@ -1050,6 +1118,46 @@ describe("sandbox egress proxy integration", () => {
     expect(response.status).toBe(204);
     expect(upstreamFetch).toHaveBeenCalledTimes(1);
     expect(tokenRequests).toEqual([{}]);
+  });
+
+  it("returns a Junior egress error instead of forwarding an unreadable body", async () => {
+    configureGitHubAppEnv();
+    mockGitHubInstallationToken();
+    await registerGitHubPlugin({ appPermissions: { actions: "write" } });
+    const credentialToken = modules.session.createSandboxEgressCredentialToken({
+      credentials: { actor: { type: "user", userId: ACTOR_ID } },
+      egressId: EGRESS_ID,
+      ttlMs: 60_000,
+    });
+    const forwardURL = forwardUrlFor(
+      modules.policy.buildSandboxEgressNetworkPolicy({ credentialToken }),
+      GITHUB_API_HOST,
+    );
+    const upstreamFetch = vi.fn(
+      async () => new Response(null, { status: 202 }),
+    );
+    // Production can deliver an already-used body stream. The proxy cannot
+    // tell whether the body was empty, so it must not forward the write.
+    const request = proxiedRequest({
+      body: "{}",
+      forwardURL,
+      method: "POST",
+      upstreamHost: GITHUB_API_HOST,
+      upstreamPath: "/repos/getsentry/junior/actions/runs/123/cancel",
+    });
+    await request.arrayBuffer();
+
+    const response = await modules.proxy.proxySandboxEgressRequest(request, {
+      fetch: upstreamFetch as typeof fetch,
+      verifyOidc: async () => ({ sandbox_id: EGRESS_ID }),
+    });
+
+    expect(response.status).toBe(500);
+    await expect(response.json()).resolves.toMatchObject({
+      source: "junior-egress",
+      error: expect.stringContaining("did not send the request upstream"),
+    });
+    expect(upstreamFetch).not.toHaveBeenCalled();
   });
 
   it("records GitHub GraphQL repository access errors without rewriting the response", async () => {

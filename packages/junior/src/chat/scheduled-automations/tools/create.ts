@@ -1,16 +1,19 @@
+import {
+  taskOutcomeInputSchema,
+  type TaskOutcomeInput,
+} from "@/chat/task-outcomes-schema";
 import { logInfo } from "@/chat/logging";
 import { completeText } from "@/chat/pi/client";
 import { getDb } from "@/chat/db";
+import { resolveUserTimezone } from "@/chat/identities/timezone";
 import {
   resolveTaskTitle,
   SHORT_TITLE_MAX_LENGTH,
 } from "@/chat/services/short-title";
+import { automationInstructionToolSchema } from "@/chat/automations/edit-schema";
+import { requireRequesterMention } from "@/chat/automations/requester-mention";
 import { zodTool } from "@/chat/tool-support/zod-tool";
-import {
-  resolveTaskOutcomes,
-  taskOutcomeInputSchema,
-  type TaskOutcomeInput,
-} from "@/chat/task-outcomes";
+import { resolveTaskOutcomes } from "@/chat/task-outcomes";
 import { z } from "zod";
 import { createScheduledAutomation, readScheduledAutomation } from "../tasks";
 import {
@@ -24,7 +27,6 @@ import type { ScheduledAutomation } from "../types";
 import {
   buildTaskId,
   getConversationAccess,
-  getDefaultScheduleTimezone,
   requireActiveChannel,
   requireActor,
   sameDestination,
@@ -47,11 +49,11 @@ export function createSlackScheduleCreateAutomationTool(
       readOnlyHint: false,
     },
     description:
-      "Create a one-time or recurring Junior task in the active Slack channel.",
+      "Create a one-time or recurring Junior task in the active Slack channel. Store the requested future work; do not perform it or check its service access now unless the user also asks for that.",
     executionMode: "sequential",
     inputSchema: z
       .object({
-        instruction: z.string().min(1).max(4000),
+        instruction: automationInstructionToolSchema,
         title: z
           .string()
           .trim()
@@ -129,6 +131,7 @@ export function createSlackScheduleCreateAutomationTool(
         );
       }
 
+      requireRequesterMention(input.instruction, context.actor);
       const creator = await context.users.resolveActor();
       const identity = creator?.identity;
       if (
@@ -143,10 +146,18 @@ export function createSlackScheduleCreateAutomationTool(
       }
 
       const nowMs = context.now?.() ?? Date.now();
+      const defaultTimezone =
+        input.schedule.timezone ??
+        (await resolveUserTimezone({
+          db,
+          nowMs,
+          slack: { teamId: destination.teamId, userId: actor.slackUserId },
+          ...(creator.user ? { userId: creator.user.id } : undefined),
+        }));
       let compiled;
       try {
         compiled = compileScheduleIntent({
-          defaultTimezone: getDefaultScheduleTimezone(),
+          defaultTimezone,
           intent: input.schedule,
           nowMs,
         });
@@ -161,6 +172,7 @@ export function createSlackScheduleCreateAutomationTool(
         context.source,
       );
       const title = await resolveTaskTitle({
+        signal: options.signal,
         completeText,
         instruction: input.instruction,
         title: input.title,

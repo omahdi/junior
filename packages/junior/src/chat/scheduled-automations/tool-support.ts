@@ -24,7 +24,6 @@ import type {
   ScheduledAutomation,
   ScheduledAutomationConversationAccess,
   ScheduledAutomationPrincipal,
-  ScheduledAutomationStatus,
 } from "./types";
 import { effectiveTaskOutcomes } from "@/chat/task-outcomes";
 
@@ -41,13 +40,12 @@ export interface SchedulerToolContext {
 
 const TASK_ID_PREFIX = "sched";
 export const MAX_LISTED_TASKS = 50;
-const DEFAULT_SCHEDULE_TIMEZONE = "America/Los_Angeles";
 
 const compactTaskResultSchema = z
   .object({
     id: z.string(),
     title: z.string().nullable(),
-    status: z.enum(["active", "blocked", "completed", "deleted"]),
+    status: z.enum(["active", "blocked", "paused", "completed", "deleted"]),
     statusReason: z.string().nullable(),
     createdAt: z.string().datetime(),
     updatedAt: z.string().datetime(),
@@ -321,6 +319,7 @@ export async function scheduleAutomationToolResult(
     title,
     url: automation.dashboardUrl,
     description: automation.instruction,
+    status: automation.status,
     trigger:
       task.schedule.kind === "one_off" && task.nextRunAtMs !== undefined
         ? `${new Intl.DateTimeFormat("en-US", {
@@ -383,14 +382,9 @@ export function buildTaskId(args: {
 /** Accept only persisted scheduler statuses from model-facing update input. */
 export function normalizeStatus(
   value: string | undefined,
-): ScheduledAutomationStatus | undefined {
+): "active" | "blocked" | undefined {
   if (value === "active" || value === "blocked") {
     return value;
   }
   return undefined;
-}
-
-/** Centralize scheduler timezone defaulting for all concrete tool entry points. */
-export function getDefaultScheduleTimezone(): string {
-  return process.env.JUNIOR_TIMEZONE?.trim() || DEFAULT_SCHEDULE_TIMEZONE;
 }

@@ -38,6 +38,8 @@ Watches route events back into an existing conversation.
   destination or rewrite the conversation id.
 - Root conversations set destination on first upsert. Later event wakes
   use that destination.
+- An automation run's Location starts at the channel top level. Its first
+  post starts the thread, so later event Turns reply there.
 - Ingestion only wakes that Conversation mailbox with plain system input. The
   input contains text and event metadata. Destination and Location stay on the
   Conversation. The shared mailbox worker runs a normal Turn. Slack supplies
@@ -67,6 +69,11 @@ Watches route events back into an existing conversation.
   from the resource type `matchFields`. Core drops events that do not match
   before any wake. `resourceType` and `label` are display metadata, not match
   keys.
+- A resource type may declare the shape of its identifiers. Resource types can
+  share event types, so the identifier shows which one a selector names. Core
+  rejects a watch or event automation whose identifier does not fit its
+  resource type, and the error gives the format. Event type search returns the
+  format.
 - Duplicate provider deliveries must not create duplicate conversation work.
 - A conversation may run only a bounded streak of consecutive automated turns.
   After that limit, later event wakes stay quiet until a user message
@@ -84,6 +91,37 @@ Watches route events back into an existing conversation.
   that text only for the matching resource type. The prompt applies it within
   the subscription intent or stored event automation instruction. Keep it separate
   from trusted data and untrusted provider content.
+
+## Timer Watches
+
+`watchTimer({ afterMs, intent })` returns a Watch id and `firesAtMs`. It stores
+one temporary Watch in the current Conversation. It does not hold a process or
+Sandbox open. Use an Event Watch when the required Event is available.
+
+- Delays must be positive integers and cannot exceed 29 days. The Watch expires
+  24 hours after its deadline, within the existing 30-day limit.
+- The Conversation and tool-call id determine the timer id. Replaying a call
+  returns its stored deadline without resetting an active or terminal Watch.
+  This protection lasts while the Watch record is retained.
+- `timer-index.ts` owns the Redis sorted set of pending timer ids. The score is
+  the next eligible dispatch time. Heartbeat claims at most 25 ids and moves
+  their scores forward by two minutes. No scan of all Watches is needed.
+- Registration writes indexes before the record while holding the Watch and
+  Conversation index locks. A crash can leave a missing record in the due
+  index, but cannot leave a saved timer outside that index. Heartbeat checks
+  the record under the same Watch lock before removing a stale entry.
+- `timers.ts` publishes a terminal `junior / timer.fired` Event with a stable
+  Event key. Existing ingestion owns mailbox delivery and duplicate suppression.
+  A failed dispatch remains eligible after the claim expires.
+- Timers keep normal Event batching and run as the system Actor. They do not
+  retain the creator's credentials. The minute heartbeat, Event batching,
+  queue load, and active Turns can delay execution beyond the deadline.
+- Existing list, stop, and thread opt-out actions cover timers. Cancellation
+  before delivery prevents input. It cannot recall input already delivered.
+- Heartbeat removes missing, expired, or terminal entries from the due index.
+  Expired timers do not start a Turn. Automated-turn limits still apply.
+
+There is no recurrence, reset API, separate Automation, or delayed timer queue.
 
 The plugin-facing types and publisher contract live in
 `packages/junior-plugin-api/src/events.ts`. Watch storage and ingestion live in

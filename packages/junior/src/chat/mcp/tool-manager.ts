@@ -12,6 +12,7 @@ import type { OAuthClientProvider } from "@modelcontextprotocol/sdk/client/auth.
 import {
   missingToolAnnotationKeys,
   type PluginMcpToolResult,
+  type PluginMcpContent,
   type ToolAnnotations,
 } from "@sentry/junior-plugin-api";
 import {
@@ -260,9 +261,19 @@ function extractMcpErrorMessage(result: PluginMcpToolCallResult): string {
 
 export interface McpToolSuccessHookInput {
   arguments: Record<string, unknown>;
+  content?: PluginMcpContent[];
   provider: string;
   structuredContent?: unknown;
   toolName: string;
+}
+
+/**
+ * Why a call needs MCP authorization. The agent writes `intent`, so treat it
+ * as untrusted text.
+ */
+export interface McpAuthorizationContext {
+  intent?: string;
+  toolName?: string;
 }
 
 export interface McpToolManagerOptions {
@@ -276,6 +287,7 @@ export interface McpToolManagerOptions {
   onAuthorizationRequired?: (
     provider: string,
     error: McpAuthorizationRequiredError,
+    context?: McpAuthorizationContext,
   ) => Promise<boolean | void> | boolean | void;
   /**
    * Optional post-success processor for model-facing MCP tool calls.
@@ -314,7 +326,11 @@ export interface ManagedMcpTool extends ManagedMcpToolDescriptor {
   execute: (
     args: Record<string, unknown>,
     options?: {
+      /** Agent-written purpose shown if this call needs user authorization. */
+      authorizationIntent?: string;
       conversationPrivacy?: ConversationPrivacy;
+      /** Cancels the provider request when the host preempts the call. */
+      signal?: AbortSignal;
       toolCallId?: string;
     },
   ) => Promise<ManagedMcpToolResult>;
@@ -363,7 +379,10 @@ export class McpToolManager {
       }));
   }
 
-  async activateProvider(provider: string): Promise<boolean> {
+  async activateProvider(
+    provider: string,
+    authorizationContext?: McpAuthorizationContext,
+  ): Promise<boolean> {
     if (this.activeProviders.has(provider)) {
       return false;
     }
@@ -389,7 +408,11 @@ export class McpToolManager {
     } catch (error) {
       if (
         error instanceof McpAuthorizationRequiredError &&
-        (await this.handleAuthorizationRequired(plugin.manifest.name, error))
+        (await this.handleAuthorizationRequired(
+          plugin.manifest.name,
+          error,
+          authorizationContext,
+        ))
       ) {
         return false;
       }
@@ -571,7 +594,11 @@ export class McpToolManager {
           {},
           async () => {
             try {
-              const result = await client.callTool(tool.name, resolvedArgs);
+              const result = await client.callTool(
+                tool.name,
+                resolvedArgs,
+                options?.signal,
+              );
               if ("isError" in result && result.isError) {
                 throw new McpToolError(extractMcpErrorMessage(result));
               }
@@ -599,6 +626,7 @@ export class McpToolManager {
               };
               const cards = await this.options.onToolSuccess?.({
                 arguments: resolvedArgs,
+                content: toAgentToolContent(result),
                 provider: plugin.manifest.name,
                 ...(result.structuredContent !== undefined
                   ? { structuredContent: result.structuredContent }
@@ -614,6 +642,12 @@ export class McpToolManager {
                 (await this.handleAuthorizationRequired(
                   plugin.manifest.name,
                   error,
+                  {
+                    toolName: tool.name,
+                    ...(options?.authorizationIntent
+                      ? { intent: options.authorizationIntent }
+                      : undefined),
+                  },
                 ))
               ) {
                 const parkedContent = [
@@ -659,13 +693,15 @@ export class McpToolManager {
   private async handleAuthorizationRequired(
     provider: string,
     error: McpAuthorizationRequiredError,
+    context?: McpAuthorizationContext,
   ): Promise<boolean> {
     if (!this.options.onAuthorizationRequired) {
       return false;
     }
 
     const handled =
-      (await this.options.onAuthorizationRequired(provider, error)) === true;
+      (await this.options.onAuthorizationRequired(provider, error, context)) ===
+      true;
     if (!handled) {
       return false;
     }

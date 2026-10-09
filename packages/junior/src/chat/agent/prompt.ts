@@ -255,6 +255,13 @@ function buildUserTurnInput(args: {
       continue;
     }
 
+    if (attachment.attachmentId) {
+      userContentParts.push({
+        type: "text",
+        text: `Stored attachment: ${JSON.stringify({ attachment_id: attachment.attachmentId, filename: attachment.filename, media_type: attachment.mediaType })}. Use loadAttachment to access the original file.`,
+      });
+    }
+
     if (isVisionImageMediaType(attachment.mediaType)) {
       if (!attachment.data) {
         throw new Error("Image attachment is missing image data");
@@ -507,8 +514,14 @@ export async function assemblePrompt(args: {
     shouldPromptAgent &&
     !replayedPrompt &&
     !hasRuntimeTurnContext(promptHistoryMessages);
+  const promptMode = args.run.dispatch?.declaresResult
+    ? "automation"
+    : "conversation";
+  // Automation runs have no Delivery port. Their declared message still goes
+  // to Slack, so they keep Slack formatting rules.
   const platform =
-    args.run.delivery && args.run.location?.provider === "slack"
+    (args.run.delivery || promptMode === "automation") &&
+    args.run.location?.provider === "slack"
       ? "slack"
       : "local";
   const systemPromptContributions =
@@ -516,7 +529,10 @@ export async function assemblePrompt(args: {
   const pluginSystemPrompt = buildPluginSystemPromptContributions(
     systemPromptContributions,
   );
-  const baseInstructions = [buildSystemPrompt(platform), pluginSystemPrompt]
+  const baseInstructions = [
+    buildSystemPrompt(platform, promptMode),
+    pluginSystemPrompt,
+  ]
     .filter((section): section is string => Boolean(section))
     .join("\n\n");
   const pluginUserPromptContributions =

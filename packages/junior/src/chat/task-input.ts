@@ -4,19 +4,20 @@
  * and the reply contract. Section outline lives in `chat/README.md`.
  */
 import type { TaskOutcome } from "@sentry/junior-plugin-api";
+import { FINISH_AUTOMATION_RUN_TOOL_NAME } from "@/chat/automation-result";
 
-/** Shared closing lines for the stored outcomes. */
+/**
+ * Shared closing lines. Automations pass outcomes and end with a declared
+ * result. Watches pass no outcomes and reply in the Conversation.
+ */
 function replyContractLines(outcomes: TaskOutcome[] | undefined): string[] {
-  if (outcomes?.length === 0) {
+  if (!outcomes) {
     return [
-      "Do the work without writing a status message.",
-      "No successful output will be delivered.",
+      "When you reply, follow any reply format in the instructions.",
+      "Briefly report what you did or what is needed next.",
     ];
   }
-  return [
-    "When you reply, follow any reply format in the instructions.",
-    "Briefly report what you did or what is needed next.",
-  ];
+  return [`End with \`${FINISH_AUTOMATION_RUN_TOOL_NAME}\`.`];
 }
 
 function oneLine(value: string): string {
@@ -39,10 +40,12 @@ function clip(value: string, maxLength: number | undefined): string {
 export function renderTaskInput(args: {
   /** Stored task instruction, or subscription intent. */
   instructions: string;
-  /** Visible effects after successful work. Missing legacy values send a message. */
+  /** Stored automation outcomes. Watches omit this and reply in the Conversation. */
   outcomes?: TaskOutcome[];
   /** Human label for the matched resource, when present. */
   about?: string;
+  /** Mention of the person who created the task, so "me" in it is exact. */
+  creator?: string;
   /** Plugin guidance scoped under the instructions. */
   guidance?: string;
   /** Trusted one-line summary, when available. */
@@ -60,12 +63,18 @@ export function renderTaskInput(args: {
   }
 
   const about = args.about?.trim();
+  const creator = args.creator?.trim();
   const lines = [
     "[task]",
     "",
     "This is a task, not a message from a person.",
     "",
     ...(about ? [`About: ${oneLine(about)}`] : []),
+    ...(creator
+      ? [
+          `Created by: ${oneLine(creator)}. "Me" and "my" in the instructions mean this person: mention them in the message. If the instructions do not say "me" or "my", do not mention this person.`,
+        ]
+      : []),
     `Instructions: ${instructions}`,
   ];
 

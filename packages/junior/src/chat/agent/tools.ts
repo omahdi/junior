@@ -326,7 +326,8 @@ export async function wireAgentTools(
     pluginCatalogRuntime.getMcpProviders(),
     {
       authProviderFactory: mcpAuth.authProviderFactory,
-      onAuthorizationRequired: mcpAuth.onAuthorizationRequired,
+      onAuthorizationRequired: (provider, _error, context) =>
+        mcpAuth.onAuthorizationRequired(provider, context),
       onToolSuccess: async (input) => {
         return await pluginHooks.afterMcpTool({
           ...input,
@@ -391,6 +392,20 @@ export async function wireAgentTools(
       ? { spawnAgent: args.durability.spawnAgent }
       : undefined),
     ...(args.requestHandoff ? { handoff: args.requestHandoff } : undefined),
+    ...(args.run.dispatch?.declaresResult
+      ? {
+          // A dispatch record from before #1788 has no outcomes and sends to
+          // its Destination.
+          // TODO(dcramer): Remove this fallback, the "legacy default" line in
+          // `formatOutcomeLines`, and the same check in `finishedRunReply`
+          // when automation dispatches require `outcomes`. Automations have
+          // stored outcomes since #1788, and older dispatch records have
+          // passed the 7-day state TTL.
+          automation: {
+            sendsMessage: args.run.dispatch.outcomes?.length !== 0,
+          },
+        }
+      : undefined),
   };
   const toolRoute = resolveToolRuntimeRoute({
     actor: args.currentActor,
@@ -499,7 +514,7 @@ export async function wireAgentTools(
         await args.recordConnectedMcpProvider(provider);
       }
       if (mcpAuth.getPendingPause()) {
-        args.resume.captureResumeSnapshot(args.preAgentPromptMessages());
+        args.resume.captureHistoryBeforePrompt(args.preAgentPromptMessages());
         throw mcpAuth.getPendingPause()!;
       }
     }

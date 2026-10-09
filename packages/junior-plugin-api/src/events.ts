@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { objectTypeSchema } from "./object-presentation";
 
 export const EVENT_SUMMARY_MAX_LENGTH = 4_000;
 export const EVENT_TEXT_MAX_LENGTH = 8_000;
@@ -148,9 +149,20 @@ export function eventMatches(
   return true;
 }
 
+/** The identifier shape of one resource type. */
+export const eventIdentifierSchema = z
+  .object({
+    /** Shown to the agent, such as "owner/repo#number". */
+    format: z.string().trim().min(1).max(200),
+    /** Matches a normalized identifier of this resource type. */
+    pattern: z.instanceof(RegExp),
+  })
+  .strict();
+
 export const pluginEventTypeSchema = z
   .object({
     type: resourceTypeSchema,
+    identifier: eventIdentifierSchema.optional(),
     supportedEvents: z.array(eventTypeSchema).min(1),
     suggestedEvents: z.array(eventTypeSchema).optional(),
     matchFields: eventMatchFieldsSchema.optional(),
@@ -269,6 +281,7 @@ export type WatchResult = z.output<typeof watchResultSchema>;
 
 export const eventInputSchema = z
   .object({
+    objectType: objectTypeSchema.optional(),
     eventKey: z.string().min(1),
     eventType: eventTypeSchema,
     identifier: z.string().min(1),

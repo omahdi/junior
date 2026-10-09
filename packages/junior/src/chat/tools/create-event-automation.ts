@@ -1,6 +1,12 @@
+import {
+  taskOutcomeInputSchema,
+  type TaskOutcomeInput,
+} from "@/chat/task-outcomes-schema";
 import { createHash } from "node:crypto";
 import { z } from "zod";
 import { getDb } from "@/chat/db";
+import { automationInstructionToolSchema } from "@/chat/automations/edit-schema";
+import { requireRequesterMention } from "@/chat/automations/requester-mention";
 import {
   createEventAutomation,
   getEventAutomation,
@@ -16,7 +22,7 @@ import {
 import type { EventAutomation } from "@/chat/event-automations/types";
 import { completeText } from "@/chat/pi/client";
 import {
-  normalizeCatalogEventIdentifier,
+  requireEventIdentifier,
   type EventCatalog,
 } from "@/chat/events/catalog";
 import {
@@ -24,11 +30,7 @@ import {
   SHORT_TITLE_MAX_LENGTH,
 } from "@/chat/services/short-title";
 import { zodTool } from "@/chat/tool-support/zod-tool";
-import {
-  resolveTaskOutcomes,
-  taskOutcomeInputSchema,
-  type TaskOutcomeInput,
-} from "@/chat/task-outcomes";
+import { resolveTaskOutcomes } from "@/chat/task-outcomes";
 import { ToolInputError } from "@/chat/tools/execution/tool-input-error";
 import type { ToolRuntimeContext } from "@/chat/tools/types";
 
@@ -76,7 +78,7 @@ export function createEventAutomationTool(
       "Create a durable event automation in the active Slack channel or DM, never a thread. It executes the supplied instruction for every matching event. Use for whenever-this-happens-do-X automation; ordinary watch, notify, or tell-me-when requests use watchEvents instead. The automation may use the creator's connected credentials. Prefer a subscribable tool result when available.",
     inputSchema: z
       .object({
-        instruction: z.string().trim().min(1).max(4000),
+        instruction: automationInstructionToolSchema,
         title: z
           .string()
           .trim()
@@ -128,10 +130,12 @@ export function createEventAutomationTool(
     async execute(input, options) {
       const { actor, destination, source } =
         requireEventAutomationSlackContext(context);
+      requireRequesterMention(input.instruction, actor);
       const match = requireSupportedEventAutomationTrigger(
         catalog,
         input.trigger,
       );
+      const identifier = requireEventIdentifier(catalog, input.trigger);
       const id = buildEventAutomationId({
         channelId: destination.channelId,
         teamId: destination.teamId,
@@ -160,6 +164,7 @@ export function createEventAutomationTool(
         }
       }
       const title = await resolveTaskTitle({
+        signal: options.signal,
         completeText,
         instruction: input.instruction,
         title: input.title,
@@ -184,11 +189,7 @@ export function createEventAutomationTool(
         ...(title ? { title } : undefined),
         trigger: {
           namespace: input.trigger.namespace,
-          identifier: normalizeCatalogEventIdentifier(
-            catalog,
-            input.trigger.namespace,
-            input.trigger.identifier,
-          ),
+          identifier,
           resourceType: input.trigger.resourceType,
           label: input.trigger.label,
           events: [...new Set(input.trigger.events)],

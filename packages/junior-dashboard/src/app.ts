@@ -1,3 +1,4 @@
+import { objectIconImages } from "./object-icon-images";
 import { Hono, type Context, type Next } from "hono";
 import {
   authenticatePersonalToken,
@@ -5,12 +6,14 @@ import {
   jsonResponse,
   resolveViewerUser,
   updateViewerDisplayName,
+  type ConversationWorkQueue,
   type JuniorApiVariables,
 } from "@sentry/junior/api";
 import { apiErrorSchema } from "@sentry/junior/api/schema";
 import { initSentry } from "@sentry/junior/instrumentation";
 import { JUNIOR_VERSION } from "@sentry/junior/version";
 import { DASHBOARD_VERSION_HEADER } from "./dashboard-version";
+import { revalidateConversation } from "./conversation-cache";
 import type {
   PluginApiRouteRequestContext,
   PluginRouteApp,
@@ -43,6 +46,7 @@ import {
   dashboardPagePaths,
   readDashboardAvatarHeader,
   readDashboardClient,
+  readDashboardClientChunk,
   renderDashboard,
   renderFavicon,
   renderForbiddenPage,
@@ -87,6 +91,8 @@ export interface JuniorDashboardOptions {
 
 interface DashboardRuntimeOptions extends JuniorDashboardOptions {
   authenticatedRoutes?: readonly AuthenticatedRoute[];
+  /** The queue `createApp()` uses, so web input reaches the same worker. */
+  conversationWorkQueue?: ConversationWorkQueue;
   pluginRoutes?: DashboardPluginRoute[];
 }
 
@@ -370,6 +376,7 @@ function pluginRouteRequest(request: Request, prefix: string): Request {
 function pluginRouteContext(
   pluginName: string,
   session: DashboardSession,
+  viewer: Variables["viewer"],
 ): PluginApiRouteRequestContext {
   const { email, emailVerified, name } = session.user;
   return {
@@ -377,6 +384,7 @@ function pluginRouteContext(
       user: {
         email,
         emailVerified,
+        isAdmin: viewer?.isAdmin === true,
         name,
       },
     },
@@ -465,6 +473,24 @@ export function createDashboardApp(
     app.on(["GET", "POST"], `${authPath}/*`, (c) => auth.handler(c.req.raw));
   }
 
+  // These fixed, non-sensitive images must be public so Slack can fetch them.
+  app.get("/_junior/dashboard/object-icons/v1/:file", (c) => {
+    const file = c.req.param("file");
+    if (!file?.endsWith(".png")) return c.notFound();
+    const icon = file.slice(0, -4);
+    const image =
+      icon && Object.hasOwn(objectIconImages, icon)
+        ? objectIconImages[icon]
+        : undefined;
+    if (!image) return c.notFound();
+    return new Response(Buffer.from(image, "base64"), {
+      headers: {
+        "content-type": "image/png",
+        "cache-control": "public, max-age=31536000, immutable",
+        "x-content-type-options": "nosniff",
+      },
+    });
+  });
   app.get("/favicon.ico", () => renderFavicon());
   app.get(DASHBOARD_MANIFEST_PATH, () => renderManifest(basePath, agentName));
   app.get(DASHBOARD_INSTALL_ICON_PATH, () => renderInstallIcon());
@@ -552,6 +578,7 @@ export function createDashboardApp(
   };
 
   app.use("*", requireAuth);
+  app.use("/api/conversations/:conversationId", revalidateConversation);
 
   for (const route of authenticatedRoutes) {
     const handler = (c: Context<{ Variables: Variables }>) => {
@@ -587,7 +614,11 @@ export function createDashboardApp(
       route.app.fetch(
         pluginRouteRequest(c.req.raw, prefix),
         pluginApiRouteRequestContextSchema.parse(
-          pluginRouteContext(route.pluginName, c.get("authSession")),
+          pluginRouteContext(
+            route.pluginName,
+            c.get("authSession"),
+            c.get("viewer"),
+          ),
         ),
       );
     app.all(prefix, handler);
@@ -596,7 +627,10 @@ export function createDashboardApp(
   if (options.mockConversations) {
     app.route("/api", createMockReportingApi());
   }
-  app.route("/", createJuniorApi());
+  app.route(
+    "/",
+    createJuniorApi({ conversationWorkQueue: options.conversationWorkQueue }),
+  );
   app.get("/api/config", () => {
     return jsonResponse(dashboardConfigSchema, {
       allowedEmailCount: allowedEmails.length,
@@ -617,6 +651,7 @@ export function createDashboardApp(
       user: {
         email: session.user.email,
         emailVerified: session.user.emailVerified,
+        isAdmin: viewer?.isAdmin === true,
         name: viewer?.displayName ?? session.user.name,
       },
     });
@@ -656,6 +691,7 @@ export function createDashboardApp(
         user: {
           email: session.user.email,
           emailVerified: session.user.emailVerified,
+          isAdmin: viewer.isAdmin === true,
           name: parsed.data.displayName,
         },
       });
@@ -675,6 +711,7 @@ export function createDashboardApp(
       user: {
         email: session.user.email,
         emailVerified: session.user.emailVerified,
+        isAdmin: updated.isAdmin === true,
         name: updated.displayName,
       },
     });
@@ -684,6 +721,17 @@ export function createDashboardApp(
       headers: {
         "cache-control": "no-store",
         "content-type": "application/javascript; charset=utf-8",
+      },
+    });
+  });
+  app.get("/_junior/dashboard/chunks/:file", (c) => {
+    const chunk = readDashboardClientChunk(c.req.param("file"));
+    if (!chunk) return c.notFound();
+    return new Response(chunk, {
+      headers: {
+        "cache-control": "private, max-age=31536000, immutable",
+        "content-type": "application/javascript; charset=utf-8",
+        "x-content-type-options": "nosniff",
       },
     });
   });

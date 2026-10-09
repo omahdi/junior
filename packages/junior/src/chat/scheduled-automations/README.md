@@ -20,7 +20,20 @@ The agent input uses shared framing from `task-input.ts`. See `chat/README.md`
 
 The heartbeat bounds claims per invocation, reconciles incomplete dispatches before claiming new work, and advances recurring tasks only after their current run reaches a terminal outcome.
 
-Task status is `active`, `blocked`, `completed`, or `deleted`. There is no pause state: stop a task by deleting it, or leave it blocked when authorization/config prevents dispatch. A successful terminal run with no future occurrence becomes `completed` so creators can still find one-off reminders. Failed/skipped terminal work without a future occurrence is tombstoned as `deleted`. Listings and tool lookups hide `deleted` rows while retaining the record as a tombstone. Public workspace listings also omit `completed` rows; the creator-owned Tasks view keeps them.
+Task status is `active`, `paused`, `blocked`, `completed`, or `deleted`. A person can pause future claims without deleting history. A block means a requirement prevents dispatch. A successful terminal run with no future occurrence becomes `completed` so creators can still find one-off reminders. Failed/skipped terminal work without a future occurrence is tombstoned as `deleted`. Listings and tool lookups hide `deleted` rows while retaining the record as a tombstone. Public workspace listings also omit `completed` rows; the creator-owned Tasks view keeps them.
+
+## Timezones
+
+A new schedule uses the first available timezone from this list:
+
+1. the timezone that the user asks for;
+2. the creator's Slack profile `tz`;
+3. the creator's `junior_users.timezone`;
+4. `JUNIOR_TIMEZONE`, or `America/Los_Angeles` when that setting is absent.
+
+The create tool saves a valid Slack timezone to `junior_users.timezone`. The saved value is used only when Slack has no valid timezone. Edits keep the schedule timezone unless the user asks to change it.
+
+Do not put the timezone on the Actor. The Actor is stored with each message, and a timezone is a user preference that can change.
 
 ## Destination moves
 
@@ -35,3 +48,14 @@ Cross-channel rehomes stay destination-first and reuse the existing tools:
 3. `slackScheduleUpdateAutomation` with `destination: "here"` rehomes that existing task row into the active channel.
 
 Only the creator may change destination. Move preserves task id, instruction, schedule, creator identity, credential mode, and next run. It reclassifies conversation access from the active Slack source and refuses while an incomplete occurrence is already pending or running. Do not emulate a move with create+delete.
+
+## Pause and resume
+
+Pause stops future claims. Already-claimed work may finish but cannot remove a
+pause. Resume selects the next future Schedule time and skips missed runs.
+A missed one-off needs a new Schedule. Pausing blocked work keeps its reason;
+removing the pause restores the block until the user resolves it and resumes.
+
+Deploy all workers before using pause. Older workers read paused rows as deleted.
+Pause uses the existing text status column. Migration 0017 removes only legacy
+paused rows on installations that have not yet applied it.

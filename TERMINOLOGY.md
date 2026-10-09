@@ -34,6 +34,9 @@ Canonical words used across Junior's code and documentation.
 - **Delivery**: a function that sends Run output to the Conversation Location.
   A Conversation without Delivery stores completed assistant Messages only.
 - **User**: one person-level record. A user may have several linked identities.
+- **Admin**: a user with the Junior-wide admin role. Only the `junior admin`
+  CLI grants or revokes it. Plugins use it for setup that other users must not
+  reach. Do not add plugin-specific admin lists.
 - **Identity**: one provider account, such as a Slack account in one workspace,
   optionally linked to a user.
 - **Actor**: the runtime participant for one source invocation. Actor ids are
@@ -44,6 +47,12 @@ Canonical words used across Junior's code and documentation.
 - **Automation**: a saved instruction that Junior runs later. It has an owner,
   a trigger, an instruction, and an ordered list of outcomes.
 - **Schedule**: a time-based trigger for an Automation.
+- **Automation version**: one saved definition of an Automation. The
+  definition is its title, instruction, trigger, Destination, outcomes, and
+  credential mode. It is not the edit revision, which only rejects stale edits.
+  The active version is the newest version that matches the current
+  definition. To make an older version active, Junior saves its definition
+  again as a new version.
 - **Event**: one normalized change identified by namespace, identifier, event
   type, and an idempotency key. Plugins and core can publish Events. An Event
   can wake a Conversation. Location stays on that Conversation.
@@ -87,8 +96,15 @@ Canonical words used across Junior's code and documentation.
 - **Annotation**: saved facts or a resource link associated with one Conversation.
   The owner supplies the object identity and facts. Updating an annotation does
   not by itself send a message.
-- **Message card**: typed saved facts attached to a Message. Each surface owns
-  its layout. A card records the facts at delivery, not live resource status.
+- **Ticket**: an issue or planned work item from a provider. Object annotations
+  store this type as `task`.
+- **Deployment**: a revision sent to a target environment.
+- **Calendar event**: a meeting on a calendar. Object annotations store this
+  type as `calendar_event`.
+- **Item**: a linked object without a more specific native type.
+- **Message card**: a reference to an Annotation attached to a Message. Each
+  surface shows the latest saved facts and owns its layout. A card does not
+  record facts at delivery or fetch live provider state.
 - **Message update**: later delivery or hydration state for an existing
   message, stored as a `message_updated` event without creating another message.
 - **Transcript**: a reporting view rendered from stored messages and agent

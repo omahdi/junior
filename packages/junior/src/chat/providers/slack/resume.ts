@@ -21,18 +21,25 @@ import {
   type AgentRun,
 } from "@/chat/agent/types";
 import type { AgentRunResult } from "@/chat/services/turn-result";
+import {
+  finishedRunReply,
+  runDispatchOutcome,
+  deliversFinalText,
+} from "@/chat/automation-result";
 import { getAssistantReplyText } from "@/chat/services/assistant-reply";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
 import { AgentRunError, type ExecuteTurn } from "@/chat/runtime/turn-execution";
 import { scheduleSessionCompletedPluginTasks } from "@/chat/plugins/task-runner";
 import {
   logException,
+  setSpanAttributes,
   setTags,
   withLogContext,
   type LogContext,
 } from "@/chat/logging";
 import {
   finalizeFailedTurnReplyWithEvent,
+  getAgentTurnDiagnosticsAttributes,
   requireTurnFailureEventId,
 } from "@/chat/services/turn-failure-response";
 import { getTurnLifecycle } from "@/chat/conversations/turn-lifecycle";
@@ -77,16 +84,6 @@ import {
 import { persistWithRetry } from "@/chat/services/persist-retry";
 import { isRetryableSlackPostError } from "@/chat/slack/errors";
 import { getConversationStore } from "@/chat/db";
-
-function resolveReplyTimeoutMs(): number | undefined {
-  const raw = process.env.EVAL_AGENT_REPLY_TIMEOUT_MS?.trim();
-  if (!raw) {
-    return undefined;
-  }
-
-  const parsed = Number.parseInt(raw, 10);
-  return Number.isFinite(parsed) && parsed > 0 ? parsed : undefined;
-}
 
 async function postSlackMessageBestEffort(
   channelId: string,
@@ -353,7 +350,7 @@ function buildResumedRun(
       }
       await priorOnEvent?.(event);
     },
-    ...(savedRun.dispatch?.outcomes?.length === 0 ? undefined : { delivery }),
+    ...(deliversFinalText(savedRun.dispatch) ? { delivery } : undefined),
     durability: {
       ...savedRun.durability,
       onSandboxRefChanged: async (sandboxRef) => {
@@ -632,91 +629,85 @@ async function resumeSlackTurnInContext(
         surface: "slack",
       });
     }
-    const replyTimeoutMs = resolveReplyTimeoutMs();
-    const outcome = await runArgs.executeTurn(
-      run,
-      async (result) => {
-        const finalized = finalizeFailedTurnReplyWithEvent({
-          reply: result,
-          logException,
-        });
-        const reply = finalized.reply;
-        const dispatchErrorMessage =
-          run.dispatch && reply.diagnostics.outcome !== "success"
-            ? (reply.diagnostics.errorMessage ??
-              `Agent turn ended with ${reply.diagnostics.outcome}.`)
-            : undefined;
-        if (reply.diagnostics.outcome !== "success") {
-          await deliverAssistantMessage(reply.text);
-        }
-        runResultHandled = true;
+    const outcome = await runArgs.executeTurn(run, async (result) => {
+      const finalized = finalizeFailedTurnReplyWithEvent({
+        reply: result,
+        logException,
+      });
+      const reply = finalized.reply;
+      setSpanAttributes(getAgentTurnDiagnosticsAttributes(reply));
+      const dispatchResult = runDispatchOutcome(reply);
+      const dispatchErrorMessage = run.dispatch
+        ? dispatchResult.errorMessage
+        : undefined;
+      const replyText = finishedRunReply(reply, run.dispatch);
+      if (replyText !== undefined) {
+        await deliverAssistantMessage(replyText);
+      }
+      runResultHandled = true;
 
-        await status.clear();
-        failureCode = "persistence_failed";
-        // Save the completed Turn only after delivery. A remaining write
-        // failure must reach this provider instead of completing durable work.
-        if (reply.piMessages?.length) {
-          await saveTurnCheckpoint({
-            mode: "completed",
-            conversationId: runArgs.conversationId,
-            turnId: runArgs.turnId,
-            messages: reply.piMessages,
-            durationMs: reply.diagnostics.durationMs,
-            usage: reply.diagnostics.usage,
-            destination: run.destination,
-            destinationVisibility: visibility,
-            dispatchId: run.dispatch?.id,
-            dispatchOutcome:
-              reply.diagnostics.outcome === "success" ? "completed" : "failed",
-            ...(dispatchErrorMessage
-              ? { errorMessage: dispatchErrorMessage }
-              : undefined),
-            ...(acceptedDeliveryId
-              ? { resultMessageId: acceptedDeliveryId }
-              : undefined),
-            source: run.source,
-            actor: resumeActor,
-            surface: run.surface ?? "slack",
-            sliceId: runArgs.sliceId,
-          });
-        } else if (run.dispatch?.id) {
-          await recordTurnSummary({
-            conversationId: runArgs.conversationId,
-            destination: run.destination,
-            destinationVisibility: visibility,
-            dispatchId: run.dispatch?.id,
-            dispatchOutcome:
-              reply.diagnostics.outcome === "success" ? "completed" : "failed",
-            ...(acceptedDeliveryId
-              ? { resultMessageId: acceptedDeliveryId }
-              : undefined),
-            turnId: runArgs.turnId,
-            sliceId: runArgs.sliceId ?? 1,
-            source: run.source,
-            state:
-              reply.diagnostics.outcome === "success" ? "completed" : "failed",
-            surface: run.surface ?? "slack",
-          });
-        }
-        await runArgs.commitResult?.(reply);
-        if (reply.diagnostics.outcome === "success") {
-          shouldScheduleCompletedPluginTasks = true;
-          return {
-            outcome: assistantMessageDelivered ? "success" : "no_reply",
-          };
-        }
-
-        return {
-          outcome: "failed",
-          failureCode: "model_execution_failed",
-          ...(finalized.eventId ? { eventId: finalized.eventId } : undefined),
-          ...(finalized.failureReason
-            ? { failureReason: finalized.failureReason }
+      await status.clear();
+      failureCode = "persistence_failed";
+      // Save the completed Turn only after delivery. A remaining write
+      // failure must reach this provider instead of completing durable work.
+      if (reply.piMessages?.length) {
+        await saveTurnCheckpoint({
+          mode: "completed",
+          conversationId: runArgs.conversationId,
+          turnId: runArgs.turnId,
+          messages: reply.piMessages,
+          durationMs: reply.diagnostics.durationMs,
+          usage: reply.diagnostics.usage,
+          destination: run.destination,
+          destinationVisibility: visibility,
+          dispatchId: run.dispatch?.id,
+          dispatchOutcome: dispatchResult.outcome,
+          ...(dispatchErrorMessage
+            ? { errorMessage: dispatchErrorMessage }
             : undefined),
+          ...(acceptedDeliveryId
+            ? { resultMessageId: acceptedDeliveryId }
+            : undefined),
+          source: run.source,
+          actor: resumeActor,
+          surface: run.surface ?? "slack",
+          sliceId: runArgs.sliceId,
+        });
+      } else if (run.dispatch?.id) {
+        await recordTurnSummary({
+          conversationId: runArgs.conversationId,
+          destination: run.destination,
+          destinationVisibility: visibility,
+          dispatchId: run.dispatch?.id,
+          dispatchOutcome: dispatchResult.outcome,
+          ...(acceptedDeliveryId
+            ? { resultMessageId: acceptedDeliveryId }
+            : undefined),
+          turnId: runArgs.turnId,
+          sliceId: runArgs.sliceId ?? 1,
+          source: run.source,
+          state:
+            reply.diagnostics.outcome === "success" ? "completed" : "failed",
+          surface: run.surface ?? "slack",
+        });
+      }
+      await runArgs.commitResult?.(reply);
+      if (reply.diagnostics.outcome === "success") {
+        shouldScheduleCompletedPluginTasks = true;
+        return {
+          outcome: assistantMessageDelivered ? "success" : "no_reply",
         };
-      },
-      replyTimeoutMs,
-    );
+      }
+
+      return {
+        outcome: "failed",
+        failureCode: "model_execution_failed",
+        ...(finalized.eventId ? { eventId: finalized.eventId } : undefined),
+        ...(finalized.failureReason
+          ? { failureReason: finalized.failureReason }
+          : undefined),
+      };
+    });
     if (outcome.status !== "completed") {
       // Finish reaction cleanup before running pause or failure handlers.
       await status.clear();

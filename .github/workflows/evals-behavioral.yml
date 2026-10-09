@@ -2,6 +2,9 @@ name: Evals
 
 permissions:
   contents: read
+  # The eval-recordings-mode action reads the commits and runs of the PR.
+  pull-requests: read
+  actions: read
   checks: write
 
 on:
@@ -10,7 +13,9 @@ on:
     types: [opened, reopened, synchronize, labeled]
 
 concurrency:
-  group: evals-behavioral-${{ github.event.pull_request.number || github.ref }}
+  # A recordings commit must not cancel the runs that are still recording,
+  # so each bot that pushes has its own group.
+  group: evals-behavioral-${{ github.event.pull_request.number || github.ref }}-${{ github.event.sender.type == 'Bot' && github.event.sender.login || 'user' }}
   cancel-in-progress: true
 
 env:
@@ -22,6 +27,7 @@ jobs:
     runs-on: blacksmith-4vcpu-ubuntu-2404
     outputs:
       should_run: ${{ steps.decision.outputs.should_run }}
+      mode: ${{ steps.mode.outputs.mode || 'auto' }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -34,24 +40,28 @@ jobs:
           filters: |
             relevant:
               - 'packages/junior-evals/evals/agent/**'
+              - 'packages/junior-evals/evals/coding/**'
               - 'packages/junior-evals/evals/conversation/**'
-              - 'packages/junior-evals/evals/github/**'
+              - 'packages/junior-evals/evals/google/**'
               - 'packages/junior-evals/evals/memory/**'
               - 'packages/junior-evals/evals/scheduler/**'
               - 'packages/junior-evals/evals/sentry/**'
+              - 'packages/junior-evals/evals/skills/**'
+              - '.github/workflows/evals-behavioral.yml'
+              - '.github/actions/setup-node-pnpm/**'
+              - '.github/actions/collect-eval-recordings/**'
+              - '.github/actions/commit-eval-recordings/**'
+              - '.github/actions/eval-recordings-mode/**'
+              - 'packages/junior-evals/recordings/**'
+              - 'pnpm-lock.yaml'
+              - 'pnpm-workspace.yaml'
+              - 'packages/junior-evals/src/**'
+              - 'packages/junior-evals/fixtures/**'
               - 'packages/junior-evals/package.json'
               - 'packages/junior-evals/scripts/report.mjs'
+              - 'packages/junior-evals/scripts/network-jail.sh'
               - 'packages/junior-evals/global-setup.ts'
               - 'packages/junior-evals/postgres-global-setup.ts'
-              - 'packages/junior-evals/src/behavior-harness.ts'
-              - 'packages/junior-evals/src/eval-ai-gateway-dispatcher.ts'
-              - 'packages/junior-evals/src/eval-context.ts'
-              - 'packages/junior-evals/src/eval-egress.ts'
-              - 'packages/junior-evals/src/eval-plugin-fixtures.ts'
-              - 'packages/junior-evals/src/helpers.ts'
-              - 'packages/junior-evals/src/setup.ts'
-              - 'packages/junior-evals/src/slack-link.ts'
-              - 'packages/junior-evals/src/snapshot-warmup.ts'
               - 'packages/junior-evals/tests/**'
               - 'packages/junior-evals/vitest.evals.config.ts'
               - 'packages/junior-evals/vitest.evals.behavioral.config.ts'
@@ -91,12 +101,18 @@ jobs:
             echo "- will_run: $should_run"
             echo "- minimum_pass_rate: $EVAL_MIN_PASS_RATE"
           } >> "$GITHUB_STEP_SUMMARY"
+      - id: mode
+        if: steps.decision.outputs.should_run == 'true'
+        uses: ./.github/actions/eval-recordings-mode
+        with:
+          suite: behavioral
 
   behavioral:
     name: behavioral / shard ${{ matrix.shard }}/4
     needs: select
     if: needs.select.outputs.should_run == 'true'
     runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -139,21 +155,34 @@ jobs:
         run: |
           set -euo pipefail
           curl --fail --location --silent --show-error \
-            https://github.com/cloudflare/cloudflared/releases/download/2026.7.2/cloudflared-linux-amd64 \
+            --retry 3 --retry-max-time 120 --connect-timeout 10 --max-time 60 \
+            https://github.com/cloudflare/cloudflared/releases/download/2026.9.1/cloudflared-linux-amd64 \
             --output "$RUNNER_TEMP/cloudflared"
-          echo "ec905ea7b7e327ff8abdde8cb64697a2152de74dbcdbf6aec9db8364eb3886cd  $RUNNER_TEMP/cloudflared" | sha256sum --check
+          echo "03f1f25d1cc93b9ad6c60569d44060bc4f17ed97075760ed8cfca4b12dcd68cc  $RUNNER_TEMP/cloudflared" | sha256sum --check
           chmod +x "$RUNNER_TEMP/cloudflared"
           echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
           "$RUNNER_TEMP/cloudflared" version
-      - name: Verify eval egress lifecycle
-        run: pnpm --filter @sentry/junior-evals test tests/integration/eval-egress.test.ts
+      # The evals build a sandbox snapshot only when this file does not have it.
+      - name: Keep sandbox snapshot ids
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/junior-evals/sandbox-snapshots.json
+          key: eval-sandbox-snapshots-${{ github.run_id }}
+          restore-keys: eval-sandbox-snapshots-
       - name: Run behavioral evals
         id: run
         continue-on-error: true
         env:
           VITEST_EVALS_OUTPUT_FILE: behavioral-results-${{ matrix.shard }}.json
           VITEST_EVALS_REPORT_LEVEL: info
-        run: pnpm --filter @sentry/junior-evals evals:behavioral --shard=${{ matrix.shard }}/4
+          EVAL_RECORDING_MISSES_DIR: ${{ runner.temp }}/eval-recording-misses
+          VITEST_EVALS_REPLAY_MODE: ${{ needs.select.outputs.mode }}
+        run: packages/junior-evals/scripts/network-jail.sh pnpm --filter @sentry/junior-evals evals:behavioral --shard=${{ matrix.shard }}/4
+      - name: Collect new recordings
+        if: always() && !cancelled()
+        uses: ./.github/actions/collect-eval-recordings
+        with:
+          name: eval-recordings-behavioral-${{ matrix.shard }}
       - name: Require behavioral eval results
         id: results
         if: steps.run.conclusion != 'skipped'
@@ -164,6 +193,10 @@ jobs:
             echo "::error::missing behavioral eval results for shard ${{ matrix.shard }} ($result_file). Treat setup/runtime crashes as hard failures."
             exit 1
           fi
+          jq -e '.numTotalTests > 0 and (.testResults | length > 0)' "$result_file" >/dev/null || {
+            echo "::error::behavioral shard ${{ matrix.shard }} produced an empty report; setup did not complete."
+            exit 1
+          }
       - name: Publish behavioral shard summary
         if: steps.results.conclusion == 'success'
         uses: getsentry/vitest-evals@v0.16.1
@@ -222,3 +255,25 @@ jobs:
         env:
           SENTRY_EVALS_API_KEY: ${{ secrets.SENTRY_EVALS_API_KEY }}
         run: node packages/junior-evals/scripts/report.mjs behavioral eval-results/behavioral-results-*.json
+
+  recordings:
+    name: behavioral / commit recordings
+    needs: [select, behavioral]
+    # Only for a branch of this repository: the token of a fork run is
+    # read-only. Strict replay runs write no recordings.
+    if: ${{ always() && !cancelled() && needs.select.outputs.should_run == 'true' && needs.select.outputs.mode == 'auto' && github.event.pull_request.head.repo.full_name == github.repository }}
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    # GITHUB_TOKEN pushes the commit. It expires when the job ends, and it
+    # can do only what a person who can push a branch here can already do.
+    # The job holds no other secret, so it can run the action from the pull
+    # request.
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          sparse-checkout: .github/actions
+      - uses: ./.github/actions/commit-eval-recordings
+        with:
+          suite: behavioral

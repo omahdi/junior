@@ -1,12 +1,3 @@
-import { readdir, readFile } from "node:fs/promises";
-import { dirname, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
-import {
-  createLocalPgliteFixture,
-  pgliteBtreeGinExtension,
-  pgliteVectorExtension,
-  type LocalPgliteFixture,
-} from "@sentry/junior-testing/pglite";
 import { strictProviderSchemaProblems } from "@sentry/junior-testing/structured-output";
 import {
   createEventSource,
@@ -31,6 +22,7 @@ import {
   conversationMemoryListResponseSchema,
   createMemoryApi,
   memoryApiSchema,
+  memoryCountsResponseSchema,
   memoryDashboardResponseSchema,
   memoryListResponseSchema,
 } from "../src/api";
@@ -51,11 +43,9 @@ import type {
   MemorySupersessionDecider,
   MemorySupersessionInput,
 } from "../src/store";
+import { createMemoryFixture, type MemoryFixture } from "./fixture";
 const TEST_NOW_MS = Date.parse("2026-06-19T12:00:00.000Z");
 const TEST_EMBEDDING_DIMENSIONS = 1536;
-const __dirname = dirname(fileURLToPath(import.meta.url));
-
-type MemoryFixture = LocalPgliteFixture<MemoryDb>;
 
 const noopLogger: PluginLogger = {
   error() {},
@@ -179,26 +169,6 @@ async function runMemoryCli(fixture: MemoryFixture, argv: string[]) {
     stderr: stderr.join(""),
     stdout: stdout.join(""),
   };
-}
-
-async function createMemoryFixture(): Promise<MemoryFixture> {
-  const fixture = await createLocalPgliteFixture<MemoryDb>(memorySqlSchema, {
-    extensions: {
-      btree_gin: pgliteBtreeGinExtension,
-      vector: pgliteVectorExtension,
-    },
-  });
-  const migrationsDir = resolve(__dirname, "../migrations");
-  const migrations = (await readdir(migrationsDir))
-    .filter((filename) => filename.endsWith(".sql"))
-    .sort();
-  for (const migrationFile of migrations) {
-    const migration = await readFile(resolve(migrationsDir, migrationFile), {
-      encoding: "utf8",
-    });
-    await fixture.execute(migration);
-  }
-  return fixture;
 }
 
 async function installViewerCoreTables(fixture: MemoryFixture): Promise<void> {
@@ -2628,6 +2598,7 @@ describe("memory plugin storage", () => {
           user: {
             email: "person@example.com",
             emailVerified: true,
+            isAdmin: false,
           },
         },
         pluginName: "memory",
@@ -2728,6 +2699,15 @@ describe("memory plugin storage", () => {
       expect(
         memoryListResponseSchema.parse(await searchResponse.json()).memories,
       ).toEqual([expect.objectContaining({ id: second.memory.id })]);
+
+      const searchCountsResponse = await api.fetch(
+        new Request("http://localhost/counts?q=memory"),
+        requestContext,
+      );
+      expect(searchCountsResponse.status).toBe(200);
+      expect(
+        memoryCountsResponseSchema.parse(await searchCountsResponse.json()),
+      ).toEqual({ active: 2, personal: 1, public: 1 });
 
       const detailResponse = await api.fetch(
         new Request(`http://localhost/memories/${first.memory.id}`),

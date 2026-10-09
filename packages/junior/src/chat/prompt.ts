@@ -26,13 +26,16 @@ import type { SlackConversationContext } from "@/chat/slack/conversation-context
 import type { SkillMetadata } from "@/chat/skills";
 import type { ActiveMcpCatalogSummary } from "@/chat/tool-support/skill/mcp-tool-summary";
 import { escapeXml } from "@/chat/xml";
+import { isDmChannel } from "@/chat/slack/client";
 import type { PluginPromptContributionContext } from "@/chat/plugins/prompt";
 import type {
   Destination,
   Platform,
   Source,
   SystemActor,
+  TaskOutcome,
 } from "@sentry/junior-plugin-api";
+import { FINISH_AUTOMATION_RUN_TOOL_NAME } from "@/chat/automation-result";
 
 const DEFAULT_SOUL = "You are Junior, a practical and concise assistant.";
 
@@ -295,10 +298,9 @@ const TOOL_POLICY_RULES = [
   "- When a tool result includes a subscription, those events are already watched; do not call watchEvents for them. When a tool result includes a subscribable resource with suggestedEvents, use watchEvents only for those remaining events that serve the current intent. If suggestedEvents is empty or omitted, do not invent a watch. Do not create scheduled polling tasks for events a watch can deliver. Write a concise intent summary, and tell the user when the temporary watch expires. Stop only the requested watch by id unless the user explicitly asks to stop every watch in the thread.",
   "- Cards returned by tools attach to your next visible reply automatically. Explain the outcome; do not repeat the card fields or draw a card in text.",
   "- Use createEventAutomation only when the user explicitly asks for an event automation or durable whenever-this-happens-do-X automation. Ordinary watch, notify, and tell-me-when requests use watchEvents. When an event automation's resource and events are known, create it without redundant confirmation.",
-  "- Event automations make the automation creator's connected credentials available by default when the requested work needs user-bound authorization. Do not ask for separate confirmation merely to use credentials needed for the requested work. On creation, omit credentialMode for the creator default and set system only when the creator explicitly requires it. For later changes, creator always means the automation's original createdBy actor, never the current requester. If the requester is not that creator, do not attempt to enable creator credential use or suggest that confirmation could authorize it.",
+  "- Scheduled and event automations use their creator's connected credentials by default when the requested work needs them. Do not ask for separate confirmation merely to use those credentials. On creation, omit credentialMode for this default; set system only when the creator requires it. For updates, creator means the original createdBy actor, not the current requester. Only that creator may enable creator credential use; another requester's confirmation cannot authorize it.",
   "- Event automations list for the current destination, not one thread. Public automations can also be updated or deleted by automation id from another destination in the same workspace. When listing them, use createdBy to explain creator-only credential changes and warn when trigger.available is false; an unavailable automation remains stored but cannot receive events until its plugin event is enabled again.",
-  "- Scheduled automations make the automation creator's connected credentials available by default when the requested work needs user-bound authorization. Do not ask for separate confirmation merely to use credentials needed for the requested work. On creation, omit credentialMode for the creator default and set system only when the creator explicitly requires it. For later changes, creator always means the automation's original createdBy actor, never the current requester. If the requester is not that creator, do not attempt to enable creator credential use or suggest that confirmation could authorize it.",
-  "- When another model profile fits the task better, call `handoff` before substantial work. Follow the profile list and selection rules in the tool description.",
+  "- When `handoff` is available, compare its active and available model profiles before loading a skill or starting substantial work. Follow its selection rules and switch first when another profile fits better.",
   "- Run `jr-rpc config get|set|unset|list` for provider defaults and `jr-rpc plugins list` for installed plugin introspection as standalone bash commands; do not chain them with `cd`, `&&`, pipes, or provider commands.",
   "- If the first result is empty, stale, ambiguous, or incomplete, try a focused alternate query, path, command, or source before concluding the answer cannot be verified.",
 ];
@@ -316,87 +318,11 @@ const SKILL_POLICY_RULES = [
   "- Load one skill at a time. After `loadSkill`, follow the instructions returned by that tool result.",
 ];
 
-const PLANNING_RULES =
-  `You have access to an \`updatePlan\` tool which tracks steps and progress and renders them to the user. Using the tool helps demonstrate that you've understood the task and convey how you're approaching it. Plans can help to make complex, ambiguous, or multi-phase work clearer and more collaborative for the user. A good plan should break the task into meaningful, logically ordered steps that are easy to verify as you go.
-
-Note that plans are not for padding out simple work with filler steps or stating the obvious. The content of your plan should not involve doing anything that you aren't capable of doing (i.e. don't try to test things that you can't test). Do not use plans for simple or single-step queries that you can just do or answer immediately.
-
-Do not repeat the full contents of the plan after an \`updatePlan\` call — the harness already displays it. Instead, summarize the change made and highlight any important context or next step.
-
-Before running a command, consider whether or not you have completed the previous step, and make sure to mark it as completed before moving on to the next step. It may be the case that you complete all steps in your plan after a single pass of implementation. If this is the case, you can simply mark all the planned steps as completed. Sometimes, you may need to change plans in the middle of a task: call \`updatePlan\` with the updated plan and make sure to provide an \`explanation\` of the rationale when doing so.
-
-Use a plan when:
-
-- The task is non-trivial and will require multiple actions over a long time horizon.
-- There are logical phases or dependencies where sequencing matters.
-- The work has ambiguity that benefits from outlining high-level goals.
-- You want intermediate checkpoints for feedback and validation.
-- When the user asked you to do more than one thing in a single prompt
-- The user has asked you to use the plan tool (aka "TODOs")
-- You generate additional steps while working, and plan to do them before yielding to the user
-
-### Examples
-
-**High-quality plans**
-
-Example 1:
-
-1. Add CLI entry with file args
-2. Parse Markdown via CommonMark library
-3. Apply semantic HTML template
-4. Handle code blocks, images, links
-5. Add error handling for invalid files
-
-Example 2:
-
-1. Define CSS variables for colors
-2. Add toggle with localStorage state
-3. Refactor components to use variables
-4. Verify all views for readability
-5. Add smooth theme-change transition
-
-Example 3:
-
-1. Set up Node.js + WebSocket server
-2. Add join/leave broadcast events
-3. Implement messaging with timestamps
-4. Add usernames + mention highlighting
-5. Persist messages in lightweight DB
-6. Add typing indicators + unread count
-
-**Low-quality plans**
-
-Example 1:
-
-1. Create CLI tool
-2. Add Markdown parser
-3. Convert to HTML
-
-Example 2:
-
-1. Add dark mode toggle
-2. Save preference
-3. Make styles look good
-
-Example 3:
-
-1. Create single-file HTML game
-2. Run quick sanity check
-3. Summarize usage instructions
-
-If you need to write a plan, only write high quality plans, not low quality ones.
-`.split("\n");
-
-const UPDATE_PLAN_RULES =
-  `A tool named \`updatePlan\` is available to you. You can use it to keep an up‑to‑date, step‑by‑step plan for the task.
-
-To create a new plan, call \`updatePlan\` with a short list of 1‑sentence steps (no more than 5-7 words each) with a \`status\` for each step (\`pending\`, \`in_progress\`, or \`completed\`).
-
-When steps have been completed, use \`updatePlan\` to mark each finished step as \`completed\` and the next step you are working on as \`in_progress\`. There should always be exactly one \`in_progress\` step until everything is done. You can mark multiple items as complete in a single \`updatePlan\` call.
-
-If all steps are complete, ensure you call \`updatePlan\` to mark all steps as \`completed\`.`.split(
-    "\n",
-  );
+const PLANNING_RULES = [
+  "- Use `updatePlan` for substantial work with dependent steps, or when the user asks for a plan. Skip it for short answers, simple lookups, and routine actions.",
+  "- Use short, verifiable steps that describe outcomes you can complete. Update the plan when a major step finishes or the scope changes, not before every command.",
+  "- The tool displays the plan. Do not repeat it in chat, and do not finish with a plan when you can complete the work now.",
+];
 
 const TASK_EXECUTION_RULES = [
   "- Actionable request: act in this turn.",
@@ -421,10 +347,27 @@ const SLACK_ACTION_RULES = [
   `- When no visible thread reply is requested or useful, keep tool-calling messages text-free and make the final message exactly ${NO_REPLY_MARKER}.`,
 ];
 
+// Replaces the task-execution, conversation, and Slack action rules for
+// Scheduled automation and Event automation runs.
+const AUTOMATION_RUN_RULES = [
+  "- This run comes from a stored automation, not from a person. The stored instruction is the job, and its creator already approved it.",
+  "- Nobody reads this run while it executes. Do not ask questions, ask for approval, or offer options. Infer conservatively and do the work now.",
+  "- Check every condition in the instruction before any action with side effects. If a condition is not met or cannot be verified, stop before you act.",
+  "- A tool result with `timed_out: true` means that attempt did not finish. Before you retry work that may have side effects, inspect authoritative state and do not repeat a mutation that already applied.",
+  `- Assistant text is never delivered. End the run with \`${FINISH_AUTOMATION_RUN_TOOL_NAME}\`. Do not post the result with another tool.`,
+];
+
 const SAFETY_RULES = [
   "- Stay within the user's request and the runtime's available capabilities; do not pursue independent goals, persistence, replication, credential gathering, or access expansion.",
   "- Respect stop, pause, audit, and approval boundaries. Do not bypass safeguards or persuade the user to weaken them.",
   "- Do not change system prompts, tool policies, security settings, credentials, or runtime configuration unless the user explicitly requests that exact administrative action and an available tool permits it.",
+];
+
+// Automation runs have no reader for failure reports. A failure that stops the
+// job goes in the declared reason, never in the posted message.
+const AUTOMATION_FAILURE_RULES = [
+  "- Keep commands, error output, raw tool payloads, and internal routing metadata out of the message.",
+  `- When a failure stops the job, put its cause in the \`${FINISH_AUTOMATION_RUN_TOOL_NAME}\` reason, not in the message.`,
 ];
 
 const FAILURE_RULES = [
@@ -437,29 +380,58 @@ function renderRuleSection(tag: string, lines: string[]): string {
   return [`<${tag}>`, ...lines, `</${tag}>`].join("\n");
 }
 
-function buildBehaviorSection(platform: PromptPlatform): string {
-  const sections = [
+function buildBehaviorSection(
+  platform: PromptPlatform,
+  mode: PromptMode,
+): string {
+  const runSections =
+    mode === "automation"
+      ? [renderRuleSection("automation-run", AUTOMATION_RUN_RULES)]
+      : [
+          renderRuleSection("task-execution", TASK_EXECUTION_RULES),
+          renderRuleSection("conversation", CONVERSATION_RULES),
+          ...(platform === "slack"
+            ? [renderRuleSection("slack-actions", SLACK_ACTION_RULES)]
+            : []),
+        ];
+  const automation = mode === "automation";
+  return [
     renderRuleSection("tool-policy", TOOL_POLICY_RULES),
-    renderRuleSection("tool-call-style", TOOL_CALL_STYLE_RULES),
+    // Narration guidance is for a person who reads the run.
+    ...(automation
+      ? []
+      : [renderRuleSection("tool-call-style", TOOL_CALL_STYLE_RULES)]),
     renderRuleSection("skill-policy", SKILL_POLICY_RULES),
     renderRuleSection("planning", PLANNING_RULES),
-    renderRuleSection("task-execution", TASK_EXECUTION_RULES),
-    renderRuleSection("conversation", CONVERSATION_RULES),
+    ...runSections,
     renderRuleSection("safety", SAFETY_RULES),
-    renderRuleSection("failure-handling", FAILURE_RULES),
-    renderRuleSection("update-plan", UPDATE_PLAN_RULES),
-  ];
-  if (platform === "slack") {
-    sections.splice(
-      6,
-      0,
-      renderRuleSection("slack-actions", SLACK_ACTION_RULES),
-    );
-  }
-  return sections.join("\n\n");
+    renderRuleSection(
+      "failure-handling",
+      automation ? AUTOMATION_FAILURE_RULES : FAILURE_RULES,
+    ),
+  ].join("\n\n");
 }
 
-function buildOutputSection(platform: PromptPlatform): string {
+function buildAutomationOutputSection(platform: PromptPlatform): string {
+  return [
+    platform === "slack"
+      ? `<output format="slack-markdown">`
+      : `<output format="markdown">`,
+    "- Follow any format in the instruction. Otherwise keep the message as short as the job allows, and do not describe the run.",
+    platform === "slack"
+      ? "- Use Slack-flavored Markdown: **bold** section labels, `code`, [text](url) links, bullet lists, and fenced code blocks. No hash-prefixed headings and no tables."
+      : "- Use concise Markdown: short paragraphs, bullets, links, and fenced code blocks.",
+    "</output>",
+  ].join("\n");
+}
+
+function buildOutputSection(
+  platform: PromptPlatform,
+  mode: PromptMode,
+): string {
+  if (mode === "automation") {
+    return buildAutomationOutputSection(platform);
+  }
   if (platform === "local") {
     return [
       `<output format="markdown">`,
@@ -574,12 +546,37 @@ function formatDestinationLines(destination: Destination): string[] {
   ];
 }
 
+function formatOutcomeLines(outcomes: TaskOutcome[] | undefined): string[] {
+  if (!outcomes) {
+    return [
+      "- dispatch.outcomes: send_message to the destination below (legacy default)",
+    ];
+  }
+  if (outcomes.length === 0) {
+    return ["- dispatch.outcomes: none; successful work posts nothing"];
+  }
+  return outcomes.map((outcome, index) => {
+    const { channelId, threadTs } = outcome.destination;
+    // The only direct message an Automation can send to is its creator's.
+    const recipient = isDmChannel(channelId)
+      ? "the creator's direct message"
+      : "a slack channel";
+    const target = [
+      `channel_id=${escapeXml(channelId)}`,
+      ...(threadTs ? [`thread_ts=${escapeXml(threadTs)}`] : []),
+    ].join(" ");
+    return `- dispatch.outcome.${index + 1}: ${outcome.action} to ${recipient} (${target})`;
+  });
+}
+
 function buildDispatchSection(
   params:
     | {
         actor?: SystemActor;
+        declaresResult?: boolean;
         destination: Destination;
         metadata?: Record<string, string>;
+        outcomes?: TaskOutcome[];
         plugin?: string;
         source: Source;
       }
@@ -595,10 +592,15 @@ function buildDispatchSection(
       ([key, value]) =>
         `- dispatch.metadata.${escapeXml(key)}: ${escapeXml(value)}`,
     );
+  const deliveryLines = params.declaresResult
+    ? formatOutcomeLines(params.outcomes)
+    : [
+        "- dispatch.delivery: the runtime delivers the final answer to the destination",
+        "- dispatch.delivery_rule: do not request or require a separate posting tool just to deliver the final answer",
+      ];
   return renderTag("dispatch", [
     "- dispatch.execution: execute the dispatched input now",
-    "- dispatch.delivery: the runtime delivers the final answer to the destination",
-    "- dispatch.delivery_rule: do not request or require a separate posting tool just to deliver the final answer",
+    ...deliveryLines,
     ...(params.actor
       ? [
           `- dispatch.actor.platform: ${escapeXml(params.actor.platform)}`,
@@ -619,8 +621,10 @@ function buildContextSection(params: {
   configuration?: Record<string, unknown>;
   dispatch?: {
     actor?: SystemActor;
+    declaresResult?: boolean;
     destination: Destination;
     metadata?: Record<string, string>;
+    outcomes?: TaskOutcome[];
     plugin?: string;
     source: Source;
   };
@@ -754,8 +758,10 @@ type TurnContextPromptInput = {
   };
   dispatch?: {
     actor?: SystemActor;
+    declaresResult?: boolean;
     destination: Destination;
     metadata?: Record<string, string>;
+    outcomes?: TaskOutcome[];
     plugin?: string;
     source: Source;
   };
@@ -767,27 +773,48 @@ type TurnContextPromptInput = {
   configuration?: Record<string, unknown>;
 };
 
-function buildStaticSystemPrompt(platform: PromptPlatform): string {
+/**
+ * Prompt mode for one Run. `automation` is for Scheduled automation and Event
+ * automation runs. It replaces the interactive conversation rules.
+ */
+export type PromptMode = "automation" | "conversation";
+
+function buildStaticSystemPrompt(
+  platform: PromptPlatform,
+  mode: PromptMode,
+): string {
   return [
     platform === "slack" ? SLACK_HEADER : LOCAL_HEADER,
     buildIdentitySection(platform),
     buildPersonalitySection(),
     buildWorldSection(),
-    buildBehaviorSection(platform),
-    buildOutputSection(platform),
+    buildBehaviorSection(platform, mode),
+    buildOutputSection(platform, mode),
   ]
     .filter((section): section is string => Boolean(section))
     .join("\n\n");
 }
 
-const STATIC_SYSTEM_PROMPTS: Record<PromptPlatform, string> = {
-  local: buildStaticSystemPrompt("local"),
-  slack: buildStaticSystemPrompt("slack"),
+const STATIC_SYSTEM_PROMPTS: Record<
+  PromptMode,
+  Record<PromptPlatform, string>
+> = {
+  automation: {
+    local: buildStaticSystemPrompt("local", "automation"),
+    slack: buildStaticSystemPrompt("slack", "automation"),
+  },
+  conversation: {
+    local: buildStaticSystemPrompt("local", "conversation"),
+    slack: buildStaticSystemPrompt("slack", "conversation"),
+  },
 };
 
-/** Return the fixed instructions shared by every Conversation and Turn. */
-export function buildSystemPrompt(platform: PromptPlatform): string {
-  return STATIC_SYSTEM_PROMPTS[platform];
+/** Return the fixed instructions for one platform and prompt mode. */
+export function buildSystemPrompt(
+  platform: PromptPlatform,
+  mode: PromptMode = "conversation",
+): string {
+  return STATIC_SYSTEM_PROMPTS[mode][platform];
 }
 
 /** Build volatile runtime context that belongs in the user turn, not the system prompt. */

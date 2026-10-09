@@ -29,7 +29,6 @@ process.env.JUNIOR_STATE_ADAPTER = "redis";
 process.env.JUNIOR_STATE_KEY_PREFIX ??= `junior:eval-router:${randomUUID()}`;
 process.env.REDIS_URL =
   process.env.JUNIOR_EVAL_REDIS_URL?.trim() || "redis://127.0.0.1:6382";
-process.env.AI_FAST_MODEL ??= "anthropic/claude-haiku-4.5";
 
 export default defineConfig({
   resolve: {
@@ -49,6 +48,10 @@ export default defineConfig({
     globalSetup: [path.resolve(__dirname, "router-global-setup.ts")],
     include: ["evals/router/**/*.eval.ts"],
     maxWorkers: 1,
+    setupFiles: [
+      path.resolve(__dirname, "src/stable-setup.ts"),
+      path.resolve(__dirname, "src/recording-setup.ts"),
+    ],
     outputFile: { json: evalReportPath },
     reporters: [new DefaultEvalReporter(), "json"],
     testTimeout: ROUTER_EVAL_TEST_TIMEOUT_MS,

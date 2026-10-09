@@ -1,4 +1,8 @@
 /** Run a mailbox Turn and store its assistant Messages. */
+import {
+  readMessageAttachments,
+  type MessageAttachment,
+} from "@/chat/attachments/input";
 import { loadPendingMessageCards } from "@/chat/conversations/pending-cards";
 import { createHash } from "node:crypto";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
@@ -82,9 +86,12 @@ import { resolveConversationDestination } from "@/chat/conversations/destination
 import {
   EVENT_WAIT_MS,
   isEventMailboxMetadata,
+  timerWatchCredentialSubject,
   type EventMailboxMetadata,
 } from "@/chat/events/notification";
 import { isEventConversationMessage } from "@/chat/events/actor";
+import type { CredentialSubject } from "@/chat/credentials/context";
+import { verifyTimerWatchCredentialSubject } from "@/chat/credentials/subject";
 
 /** Extra debounce time added per additional event already batched. */
 const EVENT_WAIT_PER_EXTRA_MESSAGE_MS = 5_000;
@@ -115,6 +122,21 @@ function captureConversationTurnFailure(args: {
     },
   );
   return typeof eventId === "string" ? eventId : undefined;
+}
+
+/** Return the saved timer creator subject when it is still valid here. */
+function resumedTimerWatchCredentialSubject(
+  conversationId: string,
+  subject: CredentialSubject | undefined,
+): CredentialSubject | undefined {
+  if (subject?.binding.type !== "timer-watch") return undefined;
+  return verifyTimerWatchCredentialSubject({
+    conversationId,
+    subject,
+    watchId: subject.binding.watchId,
+  })
+    ? subject
+    : undefined;
 }
 
 function hasLostTurnInputCommit(error: unknown): boolean {
@@ -210,6 +232,7 @@ export function createConversationTurnWorker(
     const isResume = resolved.kind === "resume";
     let turnInputFacts: TurnInputFacts | undefined;
     let text = "";
+    let attachments: MessageAttachment[] = [];
     let turnId = "";
     let userMessageId = "";
     let startedAtMs = Date.now();
@@ -233,6 +256,9 @@ export function createConversationTurnWorker(
     if (resolved.kind === "mailbox") {
       const first = resolved.batch[0]!;
       text = joinMailboxText(resolved.batch.map((entry) => entry.message));
+      attachments = resolved.batch.flatMap((entry) =>
+        readMessageAttachments(entry.message.input.attachments),
+      );
       startedAtMs = first.message.createdAtMs;
       userMessageId = first.message.inboundMessageId;
       turnId = buildDeterministicTurnId(userMessageId);
@@ -277,6 +303,7 @@ export function createConversationTurnWorker(
       });
       userMessageId = userMessage.id;
       text = userMessage.text;
+      attachments = userMessage.meta?.attachments ?? [];
       startedAtMs = userMessage.createdAtMs;
       inputMessageIds = [userMessageId];
     }
@@ -286,6 +313,20 @@ export function createConversationTurnWorker(
       );
     }
     const { actor, author } = turnInputFacts;
+    // A timer Turn stays system-acted but may use its creator's grants.
+    let credentialSubject: CredentialSubject | undefined;
+    if (actor.platform === "system") {
+      credentialSubject =
+        resolved.kind === "mailbox"
+          ? timerWatchCredentialSubject(
+              context.conversationId,
+              resolved.batch.map((entry) => entry.message),
+            )
+          : resumedTimerWatchCredentialSubject(
+              context.conversationId,
+              savedTurn?.credentialSubject,
+            );
+    }
     const source = sourceFromTurnInput({
       conversationId: context.conversationId,
       source: turnInputFacts.source,
@@ -370,6 +411,7 @@ export function createConversationTurnWorker(
             createdAtMs: startedAtMs,
             author,
             meta: {
+              ...(attachments.length ? { attachments } : undefined),
               explicitMention: true,
               replied: false,
               ...(source.kind === "web"
@@ -378,6 +420,7 @@ export function createConversationTurnWorker(
               ...(event
                 ? {
                     eventType: event.eventType,
+                    eventObjectType: event.objectType,
                     ...(event.trustedSummary
                       ? { trustedSummary: event.trustedSummary }
                       : undefined),
@@ -523,13 +566,17 @@ export function createConversationTurnWorker(
               runId: currentRunId,
               instruction: {
                 text,
+                storedAttachments: attachments,
                 context: buildConversationContext(conversation, {
                   excludeMessageId: userMessageId,
                 }),
               },
               history: piMessages,
               actor,
-              credentialContext: credentialContextForActor(actor),
+              credentialContext: credentialContextForActor(
+                actor,
+                credentialSubject,
+              ),
               // TODO(dcramer): Remove AgentRun.destination after agent and tool
               // code reads AgentRun.location and no Run consumer needs it.
               destination,

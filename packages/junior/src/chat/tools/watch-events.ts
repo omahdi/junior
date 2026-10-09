@@ -1,7 +1,7 @@
 import { z } from "zod";
 import {
   eventNamespaceSchema,
-  normalizeCatalogEventIdentifier,
+  requireEventIdentifier,
   pluginSupportsEvent,
   registeredEventTypeSchema,
   registeredEventMatchSchema,
@@ -143,6 +143,9 @@ export function createWatchEventsTool(
     inputSchema: inputSchema(catalog),
     outputSchema,
     async execute(input: Input) {
+      if (input.namespace === "junior" && input.resourceType === "timer") {
+        throw new ToolInputError("Use watchTimer to create a timer Watch.");
+      }
       // TODO(subagents): child conversations (`agent:…`) still store watches on
       // their own id. When subagents matter, store the parent root id or give
       // children the parent's destination and worker path.
@@ -177,11 +180,7 @@ export function createWatchEventsTool(
         label: input.label.trim(),
         ...(match ? { match } : undefined),
         namespace: input.namespace.trim(),
-        identifier: normalizeCatalogEventIdentifier(
-          catalog,
-          input.namespace,
-          input.identifier,
-        ),
+        identifier: requireEventIdentifier(catalog, input),
         resourceType: input.resourceType.trim(),
       });
       const details = {
